@@ -6,15 +6,18 @@ const stream = require('stream')
 const crypto = require('crypto')
 const core = require('@actions/core')
 const tc = require('@actions/tool-cache')
+const exec = require('@actions/exec')
 const { performance } = require('perf_hooks')
 const linuxOSInfo = require('linux-os-info')
 
 export const windows = (os.platform() === 'win32')
 // Extract to SSD on Windows, see https://github.com/ruby/setup-ruby/pull/14
-export const drive = (windows ? (process.env['GITHUB_WORKSPACE'] || 'C')[0] : undefined)
+export const drive = (windows ? (process.env['RUNNER_TEMP'] || 'C')[0] : undefined)
+const PATH_ENV_VAR = windows ? 'Path' : 'PATH'
 
 export const inputs = {
-  selfHosted: undefined
+  selfHosted: undefined,
+  token: undefined
 }
 
 export function partition(string, separator) {
@@ -66,7 +69,8 @@ export async function time(name, block) {
 }
 
 export function isHeadVersion(rubyVersion) {
-  return ['head', 'debug',  'mingw', 'mswin', 'ucrt', 'asan'].includes(rubyVersion)
+  // asan-release counts as "head" because the version cannot be selected -- you can only get whatever's latest
+  return ['head', 'debug',  'mingw', 'mswin', 'ucrt', 'asan', 'asan-release'].includes(rubyVersion)
 }
 
 export function isStableVersion(engine, rubyVersion) {
@@ -78,7 +82,7 @@ export function isStableVersion(engine, rubyVersion) {
 }
 
 export function hasBundlerDefaultGem(engine, rubyVersion) {
-  return isBundler1Default(engine, rubyVersion) || isBundler2Default(engine, rubyVersion)
+  return isBundler1Default(engine, rubyVersion) || isBundler2PlusDefault(engine, rubyVersion)
 }
 
 export function isBundler1Default(engine, rubyVersion) {
@@ -93,7 +97,7 @@ export function isBundler1Default(engine, rubyVersion) {
   }
 }
 
-export function isBundler2Default(engine, rubyVersion) {
+export function isBundler2PlusDefault(engine, rubyVersion) {
   if (engine === 'ruby') {
     return floatVersion(rubyVersion) >= 2.7
   } else if (engine.startsWith('truffleruby')) {
@@ -105,7 +109,7 @@ export function isBundler2Default(engine, rubyVersion) {
   }
 }
 
-export function isBundler2dot2Default(engine, rubyVersion) {
+export function isBundler2dot2PlusDefault(engine, rubyVersion) {
   if (engine === 'ruby') {
     return floatVersion(rubyVersion) >= 3.0
   } else if (engine.startsWith('truffleruby')) {
@@ -115,6 +119,13 @@ export function isBundler2dot2Default(engine, rubyVersion) {
   } else {
     return false
   }
+}
+
+const UNKNOWN_TARGET_RUBY_VERSION = 9.9
+
+export function isBundler4PlusDefault(engine, rubyVersion) {
+  const version = targetRubyVersion(engine, rubyVersion)
+  return version != UNKNOWN_TARGET_RUBY_VERSION && version >= 4.0
 }
 
 export function targetRubyVersion(engine, rubyVersion) {
@@ -128,6 +139,10 @@ export function targetRubyVersion(engine, rubyVersion) {
       return 2.5
     } else if (version === 9.3) {
       return 2.6
+    } else if (version === 9.4) {
+      return 3.1
+    } else if (version === 10.0) {
+      return 3.4
     }
   } else if (engine.startsWith('truffleruby')) {
     if (version < 21.0) {
@@ -136,14 +151,18 @@ export function targetRubyVersion(engine, rubyVersion) {
       return 2.7
     } else if (version < 23.0) {
       return 3.0
+    } else if (version < 23.1) {
+      return 3.1
+    } else if (version < 24.2) {
+      return 3.2
     }
   }
 
-  return 9.9 // unknown, assume recent
+  return UNKNOWN_TARGET_RUBY_VERSION // unknown, assume recent
 }
 
 export function floatVersion(rubyVersion) {
-  const match = rubyVersion.match(/^\d+\.\d+/)
+  const match = rubyVersion.match(/^\d+(\.\d+|$)/)
   if (match) {
     return parseFloat(match[0])
   } else if (isHeadVersion(rubyVersion)) {
@@ -163,14 +182,13 @@ export async function hashFile(file) {
 
 // macos is not listed explicitly, see below
 const GitHubHostedPlatforms = [
-  'ubuntu-20.04-x64',
   'ubuntu-22.04-x64',
   'ubuntu-22.04-arm64',
   'ubuntu-24.04-x64',
   'ubuntu-24.04-arm64',
-  'windows-2019-x64',
   'windows-2022-x64',
   'windows-2025-x64',
+  'windows-11-arm64'
 ]
 
 // Precisely: whether we have builds for that platform and there are GitHub-hosted runners to test it
@@ -263,7 +281,7 @@ export function getOSNameVersionArch() {
 
 function findWindowsVersion() {
   const version = os.version()
-  const match = version.match(/^Windows Server (\d+) Datacenter/)
+  const match = version.match(/^Windows(?: Server)? (\d+) (?:Standard|Datacenter|Enterprise)/)
   if (match) {
     return match[1]
   } else {
@@ -326,7 +344,7 @@ function engineToToolCacheName(engine) {
   }[engine]
 }
 
-export function getToolCacheRubyPrefix(platform, engine, version) {
+export function getToolCacheRubyPrefix(_platform, engine, version) {
   const toolCache = getToolCachePath()
   return path.join(toolCache, engineToToolCacheName(engine), version, os.arch())
 }
@@ -348,51 +366,84 @@ export function win2nix(path) {
   return path.replace(/\\/g, '/').replace(/ /g, '\\ ')
 }
 
-// JRuby is installed after setupPath is called, so folder doesn't exist
-function rubyIsUCRT(path) {
-  return !!(fs.existsSync(path) &&
-    fs.readdirSync(path, { withFileTypes: true }).find(dirent =>
-      dirent.isFile() && dirent.name.match(/^x64-(ucrt|vcruntime\d{3})-ruby\d{3}\.dll$/)))
-}
-
 export function setupPath(newPathEntries) {
-  let msys2Type = null
-  const envPath = windows ? 'Path' : 'PATH'
-  const originalPath = process.env[envPath].split(path.delimiter)
+  const originalPath = process.env[PATH_ENV_VAR].split(path.delimiter)
   let cleanPath = originalPath.filter(entry => !/\bruby\b/i.test(entry))
 
-  core.startGroup(`Modifying ${envPath}`)
-
-  // First remove the conflicting path entries
-  if (cleanPath.length !== originalPath.length) {
-    console.log(`Entries removed from ${envPath} to avoid conflicts with default Ruby:`)
-    for (const entry of originalPath) {
-      if (!cleanPath.includes(entry)) {
-        console.log(`  ${entry}`)
+  core.group(`Modifying ${PATH_ENV_VAR}`, async () => {
+    // First remove the conflicting path entries
+    if (cleanPath.length !== originalPath.length) {
+      console.log(`Entries removed from ${PATH_ENV_VAR} to avoid conflicts with default Ruby:`)
+      for (const entry of originalPath) {
+        if (!cleanPath.includes(entry)) {
+          console.log(`  ${entry}`)
+        }
       }
+      core.exportVariable(PATH_ENV_VAR, cleanPath.join(path.delimiter))
     }
-    core.exportVariable(envPath, cleanPath.join(path.delimiter))
-  }
 
-  // Then add new path entries using core.addPath()
-  let newPath
-  const windowsToolchain = core.getInput('windows-toolchain')
-  if (windows && windowsToolchain !== 'none') {
-    // main Ruby dll determines whether mingw or ucrt build
-    msys2Type = rubyIsUCRT(newPathEntries[0]) ? 'ucrt64' : 'mingw64'
+    console.log(`Entries added to ${PATH_ENV_VAR} to use selected Ruby:`)
+    for (const entry of newPathEntries) {
+      console.log(`  ${entry}`)
+    }
+  })
 
-    // add MSYS2 in path for all Rubies on Windows, as it provides a better bash shell and a native toolchain
-    const msys2 = [`C:\\msys64\\${msys2Type}\\bin`, 'C:\\msys64\\usr\\bin']
-    newPath = [...newPathEntries, ...msys2]
-  } else {
-    newPath = newPathEntries
-  }
-  console.log(`Entries added to ${envPath} to use selected Ruby:`)
-  for (const entry of newPath) {
-    console.log(`  ${entry}`)
-  }
-  core.endGroup()
+  core.addPath(newPathEntries.join(path.delimiter))
+}
 
-  core.addPath(newPath.join(path.delimiter))
-  return msys2Type
+export async function setupJavaHome(rubyPrefix) {
+  await measure("Modifying JAVA_HOME for JRuby", async () => {
+    console.log("attempting to run with existing JAVA_HOME")
+
+    const javaHome = process.env['JAVA_HOME']
+    let java = javaHome ? path.join(javaHome, 'bin/java') : 'java'
+    let ret = await exec.exec(java, ['-jar', path.join(rubyPrefix, 'lib/jruby.jar'), '--version'], {ignoreReturnCode: true})
+
+    if (ret === 0) {
+      console.log("JRuby successfully starts, using existing JAVA_HOME")
+    } else {
+      console.log("JRuby failed to start, try Java 21 envs")
+
+      let arch = os.arch()
+      if (arch === "arm64" && os.platform() === "win32") {
+        arch = "AARCH64"
+      } else if (arch === "x64" || os.platform() !== "darwin") {
+        arch = "X64"
+      }
+
+      // JAVA_HOME_21_AARCH64 - https://github.com/actions/partner-runner-images/blob/main/images/arm-windows-11-image.md#java
+      // JAVA_HOME_21_arm64 - https://github.com/actions/runner-images/blob/main/images/macos/macos-15-arm64-Readme.md#java
+      // JAVA_HOME_21_X64 - https://github.com/actions/runner-images/blob/main/images/ubuntu/Ubuntu2404-Readme.md#java
+      let newHomeVar = `JAVA_HOME_21_${arch}`
+      let newHome = process.env[newHomeVar]
+      let bin = path.join(newHome, 'bin')
+
+      if (newHome === "undefined") {
+        throw new Error(`JAVA_HOME is not Java 21+ needed for JRuby and \$${newHomeVar} is not defined`)
+      }
+
+      console.log(`Setting JAVA_HOME to ${newHomeVar} path ${newHome}`)
+      core.exportVariable("JAVA_HOME", newHome)
+
+      console.log(`Adding ${bin} to ${PATH_ENV_VAR}`)
+      core.addPath(bin)
+    }
+  })
+}
+
+// Determines if two keys are an exact match for the purposes of cache matching
+// Specifically, this is a case-insensitive match that ignores accents
+// From actions/cache@v3 src/utils/actionUtils.ts (MIT)
+export function isExactCacheKeyMatch(key, cacheKey) {
+  return !!(
+      cacheKey &&
+      cacheKey.localeCompare(key, undefined, {
+          sensitivity: 'accent'
+      }) === 0
+  );
+}
+
+export async function download(url) {
+  const auth = inputs.token ? `token ${inputs.token}` : undefined
+  return await tc.downloadTool(url, undefined, auth)
 }

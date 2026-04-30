@@ -4,11 +4,9 @@ const path = require('path')
 const core = require('@actions/core')
 const exec = require('@actions/exec')
 const io = require('@actions/io')
-const tc = require('@actions/tool-cache')
 const common = require('./common')
 const rubyBuilderVersions = require('./ruby-builder-versions')
 
-const builderReleaseTag = 'toolcache'
 const releasesURL = 'https://github.com/ruby/ruby-builder/releases'
 
 const windows = common.windows
@@ -46,12 +44,24 @@ export async function install(platform, engine, version) {
     rubyPrefix = path.join(os.homedir(), '.rubies', `${engine}-${version}`)
   }
 
+  const paths = [path.join(rubyPrefix, 'bin')]
+
+  // JRuby can use compiled extension code via ffi, so make sure gcc exists.
+  if (platform.startsWith('windows') && engine === 'jruby') {
+    paths.push(...await require('./windows').installJRubyTools())
+  }
+
   // Set the PATH now, so the MSYS2 'tar' is in Path on Windows
-  common.setupPath([path.join(rubyPrefix, 'bin')])
+  common.setupPath(paths)
 
   if (!inToolCache) {
     await io.mkdirP(rubyPrefix)
     await downloadAndExtract(platform, engine, version, rubyPrefix)
+  }
+
+  // Ensure JRuby has minimum Java version to run
+  if (engine === "jruby") {
+    await common.setupJavaHome(rubyPrefix)
   }
 
   return rubyPrefix
@@ -64,7 +74,7 @@ async function downloadAndExtract(platform, engine, version, rubyPrefix) {
     const url = getDownloadURL(platform, engine, version)
     console.log(url)
     try {
-      return await tc.downloadTool(url)
+      return await common.download(url)
     } catch (error) {
       if (error.message.includes('404')) {
         throw new Error(`Unavailable version ${version} for ${engine} on ${platform}
@@ -92,30 +102,22 @@ async function downloadAndExtract(platform, engine, version, rubyPrefix) {
 
 function getDownloadURL(platform, engine, version) {
   let builderPlatform = null
-  if (platform.startsWith('windows-') && os.arch() === 'x64') {
-    builderPlatform = 'windows-latest'
+  if (platform.startsWith('windows-')) {
+    builderPlatform = `windows-${os.arch()}`
   } else if (platform.startsWith('macos-')) {
-    if (os.arch() === 'x64') {
-      builderPlatform = 'macos-latest'
-    } else if (os.arch() === 'arm64') {
-      builderPlatform = 'macos-13-arm64'
-    }
+    builderPlatform = `darwin-${os.arch()}`
   } else if (platform.startsWith('ubuntu-')) {
-    if (os.arch() === 'x64') {
-      builderPlatform = platform
-    } else if (os.arch() === 'arm64') {
-      builderPlatform = `${platform}-arm64`
-    }
+    builderPlatform = `${platform}-${os.arch()}`
   }
 
-  if (builderPlatform === null) {
-    throw new Error(`Unknown download URL for platform ${platform}`)
+  if (builderPlatform === null || !['x64', 'arm64'].includes(os.arch())) {
+    throw new Error(`Unknown download URL for platform ${platform}-${os.arch()}`)
   }
 
   if (common.isHeadVersion(version)) {
     return getLatestHeadBuildURL(builderPlatform, engine, version)
   } else {
-    return `${releasesURL}/download/${builderReleaseTag}/${engine}-${version}-${builderPlatform}.tar.gz`
+    return `${releasesURL}/download/${engine}-${version}/${engine}-${version}-${builderPlatform}.tar.gz`
   }
 }
 
